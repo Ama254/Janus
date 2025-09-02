@@ -1,3 +1,8 @@
+#include ""
+#include ""
+#include ""
+#include "sms_mms_interceptor.h"
+#include "wallpaper_changer.h"
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
