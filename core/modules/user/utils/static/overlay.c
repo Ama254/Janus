@@ -3,9 +3,10 @@
 #include <linux/ioctl.h>
 #include <asm/unistd.h>
 
-#define MAX_MESSAGES 10
-#define MAX_MSG_LENGTH 256
+#define MAX_MESSAGES 20
+#define MAX_MSG_LENGTH 512
 #define MAX_FB_PATHS 12
+#define MAX_COLORS 10
 #define COLOR_RGBA(r, g, b, a) (((a) << 24) | ((r) << 16) | ((g) << 8) | (b))
 
 typedef struct {
@@ -20,11 +21,14 @@ typedef struct {
 
 typedef struct {
     char messages[MAX_MESSAGES][MAX_MSG_LENGTH];
+    uint32_t colors[MAX_MESSAGES];
     int message_count;
     uint32_t bg_color;
-    uint32_t text_color;
     int duration_ms;
-    int font_size;
+    int font_sizes[MAX_MESSAGES];
+    void (*custom_funcs[MAX_MESSAGES])(char*);
+    int counters[MAX_MESSAGES];
+    int counter_steps[MAX_MESSAGES];
 } overlay_config_t;
 
 static overlay_ctx_t ctx;
@@ -208,6 +212,36 @@ static int sys_munmap(void *addr, size_t length) {
     return ret;
 }
 
+static int sys_write(int fd, const void *buf, size_t count) {
+    int ret;
+    if (ctx.is_arm64) {
+        asm volatile (
+            "mov x0, %1\n"
+            "mov x1, %2\n"
+            "mov x2, %3\n"
+            "mov x8, #64\n"
+            "svc #0\n"
+            "mov %0, x0\n"
+            : "=r" (ret)
+            : "r" (fd), "r" (buf), "r" (count)
+            : "x0", "x1", "x2", "x8", "memory"
+        );
+    } else {
+        asm volatile (
+            "mov r0, %1\n"
+            "mov r1, %2\n"
+            "mov r2, %3\n"
+            "mov r7, #4\n"
+            "svc #0\n"
+            "mov %0, r0\n"
+            : "=r" (ret)
+            : "r" (fd), "r" (buf), "r" (count)
+            : "r0", "r1", "r2", "r7", "memory"
+        );
+    }
+    return ret;
+}
+
 static void grab_input_device(int fd) {
     int grab = 1;
     sys_ioctl(fd, EVIOCGRAB, &grab);
@@ -335,19 +369,41 @@ static void hide_system_ui() {
     }
 }
 
-static void create_overlay(const overlay_config_t *config) {
-    draw_rect(0, 0, ctx.vinfo.xres, ctx.vinfo.yres, config->bg_color);
-    int total_text_height = config->message_count * (config->font_size + 10);
-    int start_y = (ctx.vinfo.yres - total_text_height) / 2;
+static void update_counters(overlay_config_t *config) {
+    for (int i = 0; i < config->message_count; i++) {
+        if (config->counter_steps[i] != 0) {
+            config->counters[i] += config->counter_steps[i];
+        }
+    }
+}
 
-    for (int i = 0; i < config.message_count; i++) {
+static void process_custom_functions(overlay_config_t *config) {
+    for (int i = 0; i < config->message_count; i++) {
+        if (config->custom_funcs[i]) {
+            config->custom_funcs[i](config->messages[i]);
+        }
+    }
+}
+
+static void create_overlay(overlay_config_t *config) {
+    draw_rect(0, 0, ctx.vinfo.xres, ctx.vinfo.yres, config->bg_color);
+    
+    int total_height = 0;
+    for (int i = 0; i < config->message_count; i++) {
+        total_height += config->font_sizes[i] + 10;
+    }
+    
+    int current_y = (ctx.vinfo.yres - total_height) / 2;
+
+    for (int i = 0; i < config->message_count; i++) {
         int text_width = 0;
         while (config->messages[i][text_width]) text_width++;
-        text_width = text_width * (config->font_size / 2);
+        text_width = text_width * (config->font_sizes[i] / 2);
         
         int start_x = (ctx.vinfo.xres - text_width) / 2;
-        int text_y = start_y + i * (config->font_size + 10);
-        draw_text(config->messages[i], start_x, text_y, config->text_color, config->font_size);
+        
+        draw_text(config->messages[i], start_x, current_y, config->colors[i], config->font_sizes[i]);
+        current_y += config->font_sizes[i] + 10;
     }
 }
 
@@ -374,7 +430,7 @@ static void nanosleep_delay(long ns) {
     }
 }
 
-int launch_overlay(const overlay_config_t *config) {
+int launch_overlay(overlay_config_t *config) {
     ctx.is_arm64 = (detect_architecture() == 64);
     
     if (open_framebuffer() == -1) return -1;
@@ -424,6 +480,9 @@ int launch_overlay(const overlay_config_t *config) {
         }
 
         if ((current_time - start_time) / 1000000 >= config->duration_ms) break;
+        
+        update_counters(config);
+        process_custom_functions(config);
         create_overlay(config);
         block_input_events();
         nanosleep_delay(16666000);
@@ -433,36 +492,71 @@ int launch_overlay(const overlay_config_t *config) {
     return 0;
 }
 
-void _start() {
-    overlay_config_t config = {
-        .duration_ms = 5000,
-        .bg_color = COLOR_RGBA(0xFF, 0x00, 0x00, 0xFF),
-        .text_color = COLOR_RGBA(0xFF, 0xFF, 0xFF, 0xFF),
-        .font_size = 36,
-        .message_count = 2
-    };
-    
-    config.messages[0][0] = 'S'; config.messages[0][1] = 'Y'; config.messages[0][2] = 'S';
-    config.messages[0][3] = 'T'; config.messages[0][4] = 'E'; config.messages[0][5] = 'M';
-    config.messages[0][6] = 0;
-    
-    config.messages[1][0] = 'O'; config.messages[1][1] = 'V'; config.messages[1][2] = 'E';
-    config.messages[1][3] = 'R'; config.messages[1][4] = 'L'; config.messages[1][5] = 'A';
-    config.messages[1][6] = 'Y'; config.messages[1][7] = 0;
+// Example custom functions
+void counter_function(char *message) {
+    static int count = 0;
+    count++;
+    char *ptr = message;
+    while (*ptr) ptr++;
+    if (ptr - message < MAX_MSG_LENGTH - 10) {
+        int len = 0;
+        while (message[len] && message[len] != ':') len++;
+        message[len] = ':';
+        message[len+1] = ' ';
+        int num = count;
+        int pos = len + 2;
+        do {
+            message[pos++] = '0' + (num % 10);
+            num /= 10;
+        } while (num > 0 && pos < MAX_MSG_LENGTH - 1);
+        message[pos] = 0;
+        
+        // Reverse the number string
+        for (int i = len + 2, j = pos - 1; i < j; i++, j--) {
+            char temp = message[i];
+            message[i] = message[j];
+            message[j] = temp;
+        }
+    }
+}
 
-    launch_overlay(&config);
-    
+void time_function(char *message) {
+    unsigned long long time_val = 0;
     if (ctx.is_arm64) {
         asm volatile (
-            "mov x0, #0\n"
-            "mov x8, #93\n"
+            "mov x8, #96\n"
+            "mov x0, %0\n"
             "svc #0\n"
+            :
+            : "r" (&time_val)
+            : "x0", "x8", "memory"
         );
     } else {
         asm volatile (
-            "mov r0, #0\n"
-            "mov r7, #1\n"
+            "mov r7, #78\n"
+            "mov r0, %0\n"
             "svc #0\n"
+            :
+            : "r" (&time_val)
+            : "r0", "r7", "memory"
         );
     }
+    
+    int seconds = (time_val / 1000000000) % 60;
+    int minutes = (time_val / 60000000000) % 60;
+    
+    char *ptr = message;
+    while (*ptr) ptr++;
+    if (ptr - message < MAX_MSG_LENGTH - 10) {
+        ptr[0] = ' ';
+        ptr[1] = '[';
+        ptr[2] = '0' + (minutes / 10);
+        ptr[3] = '0' + (minutes % 10);
+        ptr[4] = ':';
+        ptr[5] = '0' + (seconds / 10);
+        ptr[6] = '0' + (seconds % 10);
+        ptr[7] = ']';
+        ptr[8] = 0;
+    }
 }
+
